@@ -6,6 +6,7 @@
 #include "cJSON.h"
 #include "driver/dac.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "soc/rtc_io_reg.h"
 #include "soc/rtc_cntl_reg.h"
 #include "soc/sens_reg.h"
@@ -25,6 +26,8 @@
 
 #define TWDT_TIMEOUT_S          3
 #define TASK_RESET_PERIOD_S     2
+
+#define LIGHT_EN_GPIO GPIO_NUM_33
 
 #define UART_BAUD_RATE 115200
 #define UART_BUF_SIZE 1024
@@ -59,6 +62,7 @@ uint16_t cos_table_mod[1024];
 volatile uint32_t var_offset;
 volatile double zero_offset;
 volatile bool output_enable;
+volatile bool light_enable;
 
 
 void app_main(void)
@@ -89,6 +93,8 @@ void app_main(void)
                             DDS_TASK_PRIORITY,
                             &dds_task_handle,
                             1);
+
+    gpio_set_direction(LIGHT_EN_GPIO, GPIO_MODE_OUTPUT);
 
     zero_offset = -13;
     set_var_offset(90);
@@ -177,6 +183,7 @@ void com_task(void* arg)
             const cJSON *radial_json = NULL;
             const cJSON *radial_cal_json = NULL;
             const cJSON *output_enable_json = NULL;
+            const cJSON *light_enable_json = NULL;
             cJSON *input_json = cJSON_ParseWithLength(data, len);
             if (input_json == NULL) {
                 const char *error_ptr = cJSON_GetErrorPtr();
@@ -205,6 +212,13 @@ void com_task(void* arg)
                 if(output_enable_json != NULL && cJSON_IsBool(output_enable_json))
                 {
                     output_enable = cJSON_IsTrue(output_enable_json);
+                }
+
+                light_enable_json = cJSON_GetObjectItem(cdi_data_json, "light_enable");
+                if(output_enable_json != NULL && cJSON_IsBool(output_enable_json))
+                {
+                    light_enable = cJSON_IsTrue(light_enable_json);
+                    gpio_set_level(LIGHT_EN_GPIO, light_enable);
                 }
             }
             cJSON_Delete(input_json);
