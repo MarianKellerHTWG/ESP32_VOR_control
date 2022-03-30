@@ -146,8 +146,8 @@ void set_var_offset(double angle)
 
 void set_loc_angle(double angle)
 {
-    if (angle < -90) angle = -90;
-    if (angle > 90) angle = 90;
+    if (angle < -3.5) angle = -3.5;
+    if (angle > 3.5) angle = 3.5;
 
     double right_rel = 180 / (360 + angle * REL_SCALE_FACT_LOC);
     double left_rel = 180 / (360 - angle * REL_SCALE_FACT_LOC);
