@@ -28,6 +28,7 @@
 #define TASK_RESET_PERIOD_S     2
 
 #define LIGHT_EN_GPIO GPIO_NUM_33
+#define ILS_EN_GPIO GPIO_NUM_32
 
 #define UART_BAUD_RATE 115200
 #define UART_BUF_SIZE 1024
@@ -45,11 +46,25 @@
 #define FTW_IF ((F_IF*DDS_RES) / F_SAMPLE)      // Frequency tuning word for IF DDS
 #define FTW_MOD ((F_MOD*DDS_RES) / F_SAMPLE)    // Frequency tuning word for MOD DDS
 
+#define F_SAMPLE_LOC 820000L                    // Localizer sample rate in Hz
+#define F_LEFT_LOC 90L                          // LOC left freq in Hz
+#define F_RIGHT_LOC 150L                        // LOC right freq in Hz
+#define FTW_LEFT_LOC ((F_LEFT_LOC*DDS_RES) / F_SAMPLE_LOC)  // Frequency tuning word for left LOC DDS
+#define FTW_RIGHT_LOC ((F_RIGHT_LOC*DDS_RES) / F_SAMPLE_LOC)  // Frequency tuning word for left LOC DDS
+#define LONG_COS_MAX 4294967295L
+#define AMPL_MIN_DIV_LOC 33038210L
+#define REL_SCALE_FACT_LOC 56.0
+
 void dds_task(void* arg);
 void com_task(void* arg);
 void fill_sin_lookup(uint16_t* lookup_table, uint16_t table_size, uint16_t amplitude);
 void fill_cos_lookup(uint16_t* lookup_table, uint16_t table_size, uint16_t amplitude);
+void fill_long_cos_lookup(uint32_t* lookup_table ,uint16_t table_size, uint32_t amplitude);
 void set_var_offset(double angle);
+void set_loc_angle(double angle);
+void set_vor_enable(bool enable);
+void set_loc_enable(bool enable);
+void set_light_enable(bool enable);
 
 static const char* TAG = "vor_sim";
 
@@ -58,11 +73,18 @@ static TaskHandle_t com_task_handle;
 
 uint16_t cos_table[1024];
 uint16_t cos_table_mod[1024];
+uint32_t cos_table_long[1024];
 
 volatile uint32_t var_offset;
 volatile double zero_offset;
-volatile bool output_enable;
+volatile bool vor_enable;
+volatile bool loc_enable;
 volatile bool light_enable;
+
+volatile uint32_t left_ampl_div_loc;
+volatile uint32_t right_ampl_div_loc;
+volatile uint32_t left_ampl_offset_loc;
+volatile uint32_t right_ampl_offset_loc;
 
 
 void app_main(void)
@@ -94,17 +116,65 @@ void app_main(void)
                             &dds_task_handle,
                             1);
 
+    // Initialize GPIO
     gpio_set_direction(LIGHT_EN_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_direction(ILS_EN_GPIO, GPIO_MODE_OUTPUT);
 
+    // Initialize standard values
     zero_offset = -13;
     set_var_offset(90);
-    output_enable = true;
+    set_loc_angle(2.5);
+    vor_enable = false;
+    loc_enable = true;
+    light_enable = true;
+    gpio_set_level(LIGHT_EN_GPIO, light_enable);
+    gpio_set_level(ILS_EN_GPIO, loc_enable);
+}
+
+void set_var_offset(double angle)
+{
+    double correction = angle - zero_offset;
+    if (correction < 0)
+    {
+        correction += 360;
+    } else if (correction >= 360) {
+        correction -= 360;
+    }
+
+    var_offset = (uint32_t) round((DDS_RES / 360) * correction);
+}
+
+void set_loc_angle(double angle)
+{
+    if (angle < -90) angle = -90;
+    if (angle > 90) angle = 90;
+
+    double right_rel = 180 / (360 + angle * REL_SCALE_FACT_LOC);
+    double left_rel = 180 / (360 - angle * REL_SCALE_FACT_LOC);
+
+    right_ampl_div_loc = AMPL_MIN_DIV_LOC / right_rel;
+    left_ampl_div_loc = AMPL_MIN_DIV_LOC / left_rel;
+
+    if (left_ampl_div_loc < right_ampl_div_loc)
+    {
+        right_ampl_offset_loc = ((LONG_COS_MAX / left_ampl_div_loc) / 2) - ((LONG_COS_MAX / right_ampl_div_loc) / 2);
+        left_ampl_offset_loc = 0;
+    }
+    else
+    {
+        left_ampl_offset_loc = ((LONG_COS_MAX / right_ampl_div_loc) / 2) - ((LONG_COS_MAX / left_ampl_div_loc) / 2);
+        right_ampl_offset_loc = 0;
+    }
+    ESP_LOGI(TAG, "%d %d",left_ampl_offset_loc, right_ampl_offset_loc);
+    ESP_LOGI(TAG, "%lld %lld",(LONG_COS_MAX/left_ampl_div_loc), (LONG_COS_MAX/right_ampl_div_loc));
 }
 
 void dds_task(void* arg)
 {
     static uint32_t phase_accu_REF = 0;
     static uint32_t phase_accu_REF_FM = 0;
+    static uint32_t phase_accu_left_LOC = 0;
+    static uint32_t phase_accu_right_LOC = 0;
 
     // Subscribe Task to TWDT
     //ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
@@ -118,10 +188,11 @@ void dds_task(void* arg)
 
     fill_cos_lookup(cos_table, ARRAY_SIZE(cos_table), 1023);
     fill_cos_lookup(cos_table_mod, ARRAY_SIZE(cos_table_mod), 511);
+    fill_long_cos_lookup(cos_table_long, ARRAY_SIZE(cos_table_long), LONG_COS_MAX);
 
     for(;;)
     {
-        if (output_enable)
+        if (vor_enable)
         {
             //esp_task_wdt_reset();
             phase_accu_REF_FM += FTW_MOD;
@@ -135,7 +206,23 @@ void dds_task(void* arg)
             uint8_t sig_out = ((sig_ref + sig_var) >> 2) & 0xFF;
             // DAC Output signal
             SET_PERI_REG_BITS(RTC_IO_PAD_DAC1_REG, RTC_IO_PDAC1_DAC, sig_out, RTC_IO_PDAC1_DAC_S);
-        } else {
+        }
+        else if (loc_enable)
+        {
+            phase_accu_right_LOC += FTW_RIGHT_LOC;
+            phase_accu_left_LOC += FTW_LEFT_LOC;
+            uint32_t right_loc_index = (phase_accu_right_LOC >> 22) & 0x3FF;
+            uint32_t left_loc_index = (phase_accu_left_LOC >> 22) & 0x3FF;
+            uint32_t sig_right = (cos_table_long[right_loc_index] / right_ampl_div_loc) + right_ampl_offset_loc;
+            uint32_t sig_left = (cos_table_long[left_loc_index] / left_ampl_div_loc) + left_ampl_offset_loc;
+            uint8_t sig_out = sig_left + sig_right;
+            //uint32_t sig_out = cos_table_long[right_loc_index] / AMPL_MIN_DIV_LOC;
+            // DAC Output signal
+            SET_PERI_REG_BITS(RTC_IO_PAD_DAC1_REG, RTC_IO_PDAC1_DAC, sig_out, RTC_IO_PDAC1_DAC_S);
+            //ESP_LOGI(TAG, "%d", sig_out);
+        }
+        else
+        {
             // DAC Output nothing
             SET_PERI_REG_BITS(RTC_IO_PAD_DAC1_REG, RTC_IO_PDAC1_DAC, 0, RTC_IO_PDAC1_DAC_S);
         }
@@ -182,7 +269,9 @@ void com_task(void* arg)
             const cJSON *cdi_data_json = NULL;
             const cJSON *radial_json = NULL;
             const cJSON *radial_cal_json = NULL;
-            const cJSON *output_enable_json = NULL;
+            const cJSON *loc_angle_json = NULL;
+            const cJSON *vor_enable_json = NULL;
+            const cJSON *loc_enable_json = NULL;
             const cJSON *light_enable_json = NULL;
             cJSON *input_json = cJSON_ParseWithLength(data, len);
             if (input_json == NULL) {
@@ -208,14 +297,26 @@ void com_task(void* arg)
                     set_var_offset(cJSON_GetNumberValue(radial_json));
                 }
 
-                output_enable_json = cJSON_GetObjectItem(cdi_data_json, "output_enable");
-                if(output_enable_json != NULL && cJSON_IsBool(output_enable_json))
+                loc_angle_json = cJSON_GetObjectItem(cdi_data_json, "loc_angle");
+                if (loc_angle_json != NULL && cJSON_IsNumber(loc_angle_json))
                 {
-                    output_enable = cJSON_IsTrue(output_enable_json);
+                    set_loc_angle(cJSON_GetNumberValue(loc_angle_json));
+                }
+
+                vor_enable_json = cJSON_GetObjectItem(cdi_data_json, "vor_enable");
+                if(vor_enable_json != NULL && cJSON_IsBool(vor_enable_json))
+                {
+                    set_vor_enable(cJSON_IsTrue(vor_enable_json));
+                }
+
+                loc_enable_json = cJSON_GetObjectItem(cdi_data_json, "loc_enable");
+                if(loc_enable_json != NULL && cJSON_IsBool(loc_enable_json))
+                {
+                    set_loc_enable(cJSON_IsTrue(loc_enable_json));
                 }
 
                 light_enable_json = cJSON_GetObjectItem(cdi_data_json, "light_enable");
-                if(output_enable_json != NULL && cJSON_IsBool(output_enable_json))
+                if(light_enable_json != NULL && cJSON_IsBool(light_enable_json))
                 {
                     light_enable = cJSON_IsTrue(light_enable_json);
                     gpio_set_level(LIGHT_EN_GPIO, light_enable);
@@ -249,15 +350,44 @@ void fill_cos_lookup(uint16_t* lookup_table ,uint16_t table_size, uint16_t ampli
     }
 }
 
-void set_var_offset(double angle)
+void fill_long_cos_lookup(uint32_t* lookup_table ,uint16_t table_size, uint32_t amplitude)
 {
-    double correction = angle - zero_offset;
-    if (correction < 0)
+    for (uint16_t i = 0; i < table_size; i++)
     {
-        correction += 360;
-    } else if (correction >= 360) {
-        correction -= 360;
+        double phase = ((double) i / (double) table_size);
+        double rad = (2 * PI) * phase;
+        lookup_table[i] = (uint32_t) round(((cos(rad) + 1) * ((double) amplitude / 2)));
     }
+}
 
-    var_offset = (uint32_t) round((DDS_RES / 360) * correction);
+void set_vor_enable(bool enable)
+{
+    vor_enable = enable;
+
+    // only affect other modes when this is enabled
+    if (enable)
+    {
+        // disable loc
+        loc_enable = false;
+        gpio_set_level(ILS_EN_GPIO, false);
+    }
+}
+
+void set_loc_enable(bool enable)
+{
+    loc_enable = enable;
+    gpio_set_level(ILS_EN_GPIO, enable);
+
+    // only affect other modes when this is enabled
+    if (enable)
+    {
+        // disable vor
+        vor_enable = false;
+    }
+}
+
+void set_light_enable(bool enable)
+{
+    light_enable = enable;
+    gpio_set_level(LIGHT_EN_GPIO, enable);
 }
