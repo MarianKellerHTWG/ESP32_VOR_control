@@ -55,8 +55,8 @@
 #define AMPL_MIN_DIV_LOC 33038210L
 #define REL_SCALE_FACT_LOC 56.0
 
-void dds_task(void* arg);
-void com_task(void* arg);
+void dds_task(void* arg) __attribute__((noreturn));
+void com_task(void* arg) __attribute__((noreturn));
 void fill_sin_lookup(uint16_t* lookup_table, uint16_t table_size, uint16_t amplitude);
 void fill_cos_lookup(uint16_t* lookup_table, uint16_t table_size, uint16_t amplitude);
 void fill_long_cos_lookup(uint32_t* lookup_table ,uint16_t table_size, uint32_t amplitude);
@@ -165,8 +165,8 @@ void set_loc_angle(double angle)
         left_ampl_offset_loc = ((LONG_COS_MAX / right_ampl_div_loc) / 2) - ((LONG_COS_MAX / left_ampl_div_loc) / 2);
         right_ampl_offset_loc = 0;
     }
-    ESP_LOGI(TAG, "%d %d",left_ampl_offset_loc, right_ampl_offset_loc);
-    ESP_LOGI(TAG, "%lld %lld",(LONG_COS_MAX/left_ampl_div_loc), (LONG_COS_MAX/right_ampl_div_loc));
+    //ESP_LOGI(TAG, "%d %d",left_ampl_offset_loc, right_ampl_offset_loc);
+    //ESP_LOGI(TAG, "%lld %lld",(LONG_COS_MAX/left_ampl_div_loc), (LONG_COS_MAX/right_ampl_div_loc));
 }
 
 void dds_task(void* arg)
@@ -273,14 +273,30 @@ void com_task(void* arg)
             const cJSON *vor_enable_json = NULL;
             const cJSON *loc_enable_json = NULL;
             const cJSON *light_enable_json = NULL;
+            cJSON *ok_list_json = NULL;
+            //cJSON *ok_radial = NULL;
+            //cJSON *ok_radial_cal = NULL;
+            //cJSON *ok_loc_angle = NULL;
+            //cJSON *ok_vor_enable = NULL;
+            //cJSON *ok_loc_enable = NULL;
+            //cJSON *ok_light_enable = NULL;
             cJSON *input_json = cJSON_ParseWithLength(data, len);
             if (input_json == NULL) {
                 const char *error_ptr = cJSON_GetErrorPtr();
                 if (error_ptr != NULL) {
-                    fprintf(stderr, "JSON Error\n");
+                    fprintf(stderr, "{\"error\":{\"JSON\":\"parsing error\"}}\n");
                 }
-                continue;
+                goto com_task_loop_end;
             }
+            cJSON *output_json = cJSON_CreateObject();
+            ok_list_json = cJSON_CreateObject();
+            if (output_json == NULL || ok_list_json == NULL)
+            {
+                fprintf(stderr, "{\"error\":{\"JSON\":\"Could not initialize data structure\"}}\n");
+                cJSON_Delete(output_json);
+                goto com_task_loop_end;
+            }
+            cJSON_AddItemToObject(output_json, "ok", ok_list_json);
 
             cdi_data_json = cJSON_GetObjectItem(input_json, "CDI_data");
             if(cdi_data_json != NULL)
@@ -288,40 +304,54 @@ void com_task(void* arg)
                 radial_cal_json = cJSON_GetObjectItem(cdi_data_json, "radial_cal");
                 if (radial_cal_json != NULL && cJSON_IsNumber(radial_cal_json))
                 {
+                    cJSON_AddNumberToObject(ok_list_json, "radial_cal", 0);
                     zero_offset = cJSON_GetNumberValue(radial_cal_json);
                 }
 
                 radial_json = cJSON_GetObjectItem(cdi_data_json, "radial");
                 if (radial_json != NULL && cJSON_IsNumber(radial_json))
                 {
+                    cJSON_AddNumberToObject(ok_list_json, "radial", 0);
                     set_var_offset(cJSON_GetNumberValue(radial_json));
                 }
 
                 loc_angle_json = cJSON_GetObjectItem(cdi_data_json, "loc_angle");
                 if (loc_angle_json != NULL && cJSON_IsNumber(loc_angle_json))
                 {
+                    cJSON_AddNumberToObject(ok_list_json, "loc_angle", 0);
                     set_loc_angle(cJSON_GetNumberValue(loc_angle_json));
                 }
 
                 vor_enable_json = cJSON_GetObjectItem(cdi_data_json, "vor_enable");
                 if(vor_enable_json != NULL && cJSON_IsBool(vor_enable_json))
                 {
+                    cJSON_AddNumberToObject(ok_list_json, "vor_enable", 0);
                     set_vor_enable(cJSON_IsTrue(vor_enable_json));
                 }
 
                 loc_enable_json = cJSON_GetObjectItem(cdi_data_json, "loc_enable");
                 if(loc_enable_json != NULL && cJSON_IsBool(loc_enable_json))
                 {
+                    cJSON_AddNumberToObject(ok_list_json, "loc_enable", 0);
                     set_loc_enable(cJSON_IsTrue(loc_enable_json));
                 }
 
                 light_enable_json = cJSON_GetObjectItem(cdi_data_json, "light_enable");
                 if(light_enable_json != NULL && cJSON_IsBool(light_enable_json))
                 {
+                    cJSON_AddNumberToObject(ok_list_json, "light_enable", 0);
                     light_enable = cJSON_IsTrue(light_enable_json);
                     gpio_set_level(LIGHT_EN_GPIO, light_enable);
                 }
             }
+
+            if (output_json != NULL)
+            {
+                char* out = cJSON_Print(output_json);
+                printf("%s\n", out);
+                cJSON_Delete(output_json);
+            }
+            com_task_loop_end:
             cJSON_Delete(input_json);
         }
         esp_task_wdt_reset();
